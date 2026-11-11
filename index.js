@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { MongoClient } from 'mongodb';
+import { MongoClient, ObjectId } from 'mongodb';
 import 'dotenv/config'
 
 
@@ -40,10 +40,23 @@ app.get('/jobs', async (req, res) => {
     const result = await jobs.find({}).sort({ createdAt: -1 }).toArray();
     res.send(result);
 });
+app.get('/jobs/:id', async (req, res) => {
+    const id = req.params.id;
+    const query = { _id: new ObjectId(id) };
+    const result = await jobs.findOne(query);
+    res.send(result);
+});
 
 app.post('/jobs', async (req, res) => {
     const job = { ...req.body, createdAt: new Date() };
     const result = await jobs.insertOne(job);
+    res.send(result);
+});
+
+app.delete('/jobs/:id', async (req, res) => {
+    const id = req.params.id;
+    const query = { _id: new ObjectId(id) };
+    const result = await jobs.deleteOne(query);
     res.send(result);
 });
 
