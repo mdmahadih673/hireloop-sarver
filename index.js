@@ -53,12 +53,25 @@ app.post('/jobs', async (req, res) => {
     res.send(result);
 });
 
+
 app.delete('/jobs/:id', async (req, res) => {
     const id = req.params.id;
     const query = { _id: new ObjectId(id) };
     const result = await jobs.deleteOne(query);
     res.send(result);
 });
+
+
+app.patch('/jobs/:id', async (req, res) => {
+    const id = req.params.id;
+    const query = { _id: new ObjectId(id) };
+    const updateDoc = {
+        $set: req.body,
+    };
+    const result = await jobs.updateOne(query, updateDoc);
+    res.send(result);
+});
+
 
 app.get('/', (req, res) => {
     res.send('Hello World!')
