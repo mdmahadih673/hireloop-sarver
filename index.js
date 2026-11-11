@@ -27,12 +27,24 @@ export async function connectToMongoDB() {
 const connectedClient = await connectToMongoDB();
 const database = connectedClient.db("hireloopdb");
 const users = database.collection("user");
+const jobs = database.collection("jobs");
 
 
 app.get('/users', async (req, res) => {
     const cursor = users.find({});
     const results = await cursor.toArray();
     res.send(results);
+});
+
+app.get('/jobs', async (req, res) => {
+    const result = await jobs.find({}).sort({ createdAt: -1 }).toArray();
+    res.send(result);
+});
+
+app.post('/jobs', async (req, res) => {
+    const job = { ...req.body, createdAt: new Date() };
+    const result = await jobs.insertOne(job);
+    res.send(result);
 });
 
 app.get('/', (req, res) => {
