@@ -36,10 +36,46 @@ app.get('/users', async (req, res) => {
     res.send(results);
 });
 
+
 app.get('/jobs', async (req, res) => {
-    const result = await jobs.find({}).sort({ createdAt: -1 }).toArray();
+    const query = {};
+    const normalizedParams = Object.fromEntries(
+        Object.entries(req.query).map(([key, value]) => [key.toLowerCase(), value])
+    );
+    const textFields = [
+        'title',
+        'companyName',
+        'category',
+        'jobType',
+        'location',
+        'deadline',
+        'minSalary',
+        'maxSalary',
+        'frequency',
+        'description',
+        'requirements',
+        'status',
+    ];
+
+    for (const field of textFields) {
+        const value = normalizedParams[field.toLowerCase()];
+        if (typeof value === 'string' && value.trim()) {
+            const escapedValue = value.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            query[field] = { $regex: escapedValue, $options: 'i' };
+        }
+    }
+
+    const isRemote = normalizedParams.isremote?.toLowerCase();
+    if (isRemote === 'true' || isRemote === 'false') {
+        query.isRemote = isRemote === 'true';
+    }
+
+
+    const result = await jobs.find(query).sort({ createdAt: -1 }).toArray();
     res.send(result);
 });
+
+
 app.get('/jobs/:id', async (req, res) => {
     const id = req.params.id;
     const query = { _id: new ObjectId(id) };
