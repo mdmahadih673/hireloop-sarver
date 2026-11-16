@@ -28,6 +28,7 @@ const connectedClient = await connectToMongoDB();
 const database = connectedClient.db("hireloopdb");
 const users = database.collection("user");
 const jobs = database.collection("jobs");
+const applications = database.collection("applications");
 
 
 app.get('/users', async (req, res) => {
@@ -106,6 +107,59 @@ app.patch('/jobs/:id', async (req, res) => {
     };
     const result = await jobs.updateOne(query, updateDoc);
     res.send(result);
+});
+
+
+app.post('/applications', async (req, res) => {
+    const { jobId, userId, applicantName, applicantEmail, jobTitle, companyName, jobType, location, isRemote } = req.body || {};
+
+    if (!jobId || !userId) {
+        return res.status(400).send({ error: "jobId and userId are required." });
+    }
+
+    const existing = await applications.findOne({ jobId, userId });
+    if (existing) {
+        return res.status(409).send({ error: "You already applied to this job." });
+    }
+
+    const application = {
+        jobId,
+        userId,
+        applicantName,
+        applicantEmail,
+        jobTitle,
+        companyName,
+        jobType,
+        location,
+        isRemote: Boolean(isRemote),
+        status: "applied",
+        appliedAt: new Date().toISOString(),
+        archived: false,
+    };
+
+    const result = await applications.insertOne(application);
+    res.status(201).send({ ...application, _id: result.insertedId });
+});
+
+
+
+
+app.get('/applications', async (req, res) => {
+    const query = {};
+    if (req.query.applicantId) {
+        query.userId = req.query.applicantId;
+    }
+    const result = await applications.find(query).toArray();
+    res.send(result);
+});
+
+app.get('/applications/count', async (req, res) => {
+    const query = {};
+    if (req.query.applicantId) {
+        query.userId = req.query.applicantId;
+    }
+    const result = await applications.countDocuments(query)
+    res.send({count: result});
 });
 
 
