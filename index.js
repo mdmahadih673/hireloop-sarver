@@ -2,6 +2,12 @@ import express from 'express';
 import cors from 'cors';
 import { MongoClient, ObjectId } from 'mongodb';
 import 'dotenv/config'
+import Stripe from 'stripe'
+
+
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
+
 
 
 const app = express()
@@ -29,6 +35,8 @@ const database = connectedClient.db("hireloopdb");
 const users = database.collection("user");
 const jobs = database.collection("jobs");
 const applications = database.collection("applications");
+const payments = database.collection("payment");
+
 
 
 app.get('/users', async (req, res) => {
@@ -159,7 +167,50 @@ app.get('/applications/count', async (req, res) => {
         query.userId = req.query.applicantId;
     }
     const result = await applications.countDocuments(query)
-    res.send({count: result});
+    res.send({ count: result });
+});
+
+// payment api 
+
+app.post('/payment/checkout-verify', async (req, res) => {
+    const { sessionId } = req.body
+    const { status,
+        payment_status,
+        customer_email,
+        metadata,
+        payment_intent, }
+        = await stripe.checkout.sessions.retrieve(sessionId);
+
+        if (status === 'complete' && payment_status === 'paid') {
+
+
+            const payment ={
+                sessionId,
+                status,
+                payment_status,
+                payment_intent,
+                payment_date: new Date(),
+                customer_email,
+                userId : metadata.userId,
+            }
+            const result = await payments.insertOne(payment)
+
+            const query = {_id : new ObjectId(metadata.userId)};
+
+            const updateDoc= {
+                $set:{
+                    premium : true
+                }
+            }
+
+            const updateResult = await users.updateOne(
+                query,
+                updateDoc
+            )
+            res.send({success:true, result, updateResult})
+            return
+        }
+        res.send({success:false, message:`Payment verification is faild`})
 });
 
 
