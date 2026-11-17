@@ -46,6 +46,15 @@ app.get('/users', async (req, res) => {
 });
 
 
+app.get('/users/:id/premimun', async (req, res) => {
+    const id = req.params.id
+    const query = { _id: new ObjectId(id) };
+    const result = await users.findOne(query, { projection: { premium: 1 } })
+    res.send(result);
+});
+
+
+
 app.get('/jobs', async (req, res) => {
     const query = {};
     const normalizedParams = Object.fromEntries(
@@ -181,36 +190,42 @@ app.post('/payment/checkout-verify', async (req, res) => {
         payment_intent, }
         = await stripe.checkout.sessions.retrieve(sessionId);
 
-        if (status === 'complete' && payment_status === 'paid') {
+    if (status === 'complete' && payment_status === 'paid') {
 
-
-            const payment ={
-                sessionId,
-                status,
-                payment_status,
-                payment_intent,
-                payment_date: new Date(),
-                customer_email,
-                userId : metadata.userId,
-            }
-            const result = await payments.insertOne(payment)
-
-            const query = {_id : new ObjectId(metadata.userId)};
-
-            const updateDoc= {
-                $set:{
-                    premium : true
-                }
-            }
-
-            const updateResult = await users.updateOne(
-                query,
-                updateDoc
-            )
-            res.send({success:true, result, updateResult})
-            return
+        const sessionQuery = { sessionId };
+        const existingPayment = await payments.findOne(sessionQuery);
+        if (existingPayment) {
+            return res.send({ success: false, message: "Payment already verified" });
         }
-        res.send({success:false, message:`Payment verification is faild`})
+
+
+        const payment = {
+            sessionId,
+            status,
+            payment_status,
+            payment_intent,
+            payment_date: new Date(),
+            customer_email,
+            userId: metadata.userId,
+        }
+        const result = await payments.insertOne(payment)
+
+        const query = { _id: new ObjectId(metadata.userId) };
+
+        const updateDoc = {
+            $set: {
+                premium: true
+            }
+        }
+
+        const updateResult = await users.updateOne(
+            query,
+            updateDoc
+        )
+        res.send({ success: true, result, updateResult })
+        return
+    }
+    res.send({ success: false, message: `Payment verification is faild` })
 });
 
 
