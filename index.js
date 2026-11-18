@@ -14,7 +14,6 @@ const app = express()
 const port = process.env.PORT || 5000;
 
 app.use(cors());
-app.use(express.json());
 
 
 
@@ -37,6 +36,97 @@ const jobs = database.collection("jobs");
 const applications = database.collection("applications");
 const payments = database.collection("payment");
 
+const premiumPlanDays = {
+    seeker: { monthly: 30, quarterly: 90, annual: 365 },
+    recruiter: { monthly: 30, quarterly: 90, annual: 365 },
+};
+
+async function activatePremiumFromCheckout(checkout) {
+    const { userId, role, planId } = checkout.metadata || {};
+    const durationDays = ['seeker', 'recruiter'].includes(role) ? premiumPlanDays[role]?.[planId] : null;
+    if (checkout.mode !== 'payment' || checkout.payment_status !== 'paid' || !ObjectId.isValid(userId || '') || !durationDays) {
+        return false;
+    }
+
+    const sessionId = checkout.id;
+    let payment = await payments.findOne({ sessionId });
+    if (!payment) {
+        const user = await users.findOne({ _id: new ObjectId(userId) }, { projection: { premiumExpiresAt: 1 } });
+        if (!user) return false;
+        const paymentIntentId = typeof checkout.payment_intent === 'string'
+            ? checkout.payment_intent
+            : checkout.payment_intent?.id;
+        const paymentIntent = paymentIntentId ? await stripe.paymentIntents.retrieve(paymentIntentId) : null;
+        const paymentDate = new Date((paymentIntent?.created ?? checkout.created) * 1000);
+        const expiresAt = new Date(paymentDate.getTime() + durationDays * 24 * 60 * 60 * 1000);
+        payment = {
+            sessionId,
+            status: checkout.status,
+            payment_status: checkout.payment_status,
+            payment_intent: checkout.payment_intent,
+            payment_date: paymentDate,
+            customer_email: checkout.customer_details?.email || checkout.customer_email,
+            userId,
+            role,
+            planId,
+            durationDays,
+            expiresAt,
+        };
+        await payments.insertOne(payment);
+    }
+
+    if (new Date(payment.expiresAt) > new Date()) {
+        await users.updateOne(
+            { _id: new ObjectId(userId) },
+            {
+                $set: { premium: true, premiumRole: role, premiumPlan: planId },
+                $max: { premiumExpiresAt: payment.expiresAt },
+            }
+        );
+    }
+    return true;
+}
+
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    const signature = req.headers['stripe-signature'];
+    let event;
+    try {
+        event = stripe.webhooks.constructEvent(req.body, signature, process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (error) {
+        console.error('Stripe webhook signature verification failed:', error.message);
+        return res.status(400).send({ error: 'Invalid Stripe webhook signature.' });
+    }
+
+    if (event.type === 'checkout.session.completed') {
+        const checkout = event.data.object;
+        const { userId, role, planId } = checkout.metadata || {};
+        if (checkout.mode === 'payment') {
+            await activatePremiumFromCheckout(checkout);
+        } else if (checkout.mode === 'subscription' && ObjectId.isValid(userId || '') && ['seeker', 'recruiter'].includes(role)) {
+            await users.updateOne(
+                { _id: new ObjectId(userId) },
+                { $set: { premium: true, premiumRole: role, premiumPlan: planId, stripeSubscriptionId: checkout.subscription } }
+            );
+        }
+    }
+
+    if (event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.deleted') {
+        const subscription = event.data.object;
+        const { userId, role, planId } = subscription.metadata || {};
+        if (ObjectId.isValid(userId || '') && ['seeker', 'recruiter'].includes(role)) {
+            const premium = ['active', 'trialing'].includes(subscription.status);
+            await users.updateOne(
+                { _id: new ObjectId(userId) },
+                { $set: { premium, premiumRole: role, premiumPlan: planId, stripeSubscriptionId: subscription.id } }
+            );
+        }
+    }
+
+    res.send({ received: true });
+});
+
+app.use(express.json());
+
 
 
 app.get('/users', async (req, res) => {
@@ -48,9 +138,14 @@ app.get('/users', async (req, res) => {
 
 app.get('/users/:id/premimun', async (req, res) => {
     const id = req.params.id
+    if (!ObjectId.isValid(id)) return res.status(400).send({ error: 'Invalid user id.' });
     const query = { _id: new ObjectId(id) };
-    const result = await users.findOne(query, { projection: { premium: 1 } })
-    res.send(result);
+    const result = await users.findOne(query, { projection: { premium: 1, premiumExpiresAt: 1, premiumRole: 1, premiumPlan: 1 } });
+    if (!result) return res.status(404).send({ error: 'User not found.' });
+
+    const premium = Boolean(result.premium) && (!result.premiumExpiresAt || new Date(result.premiumExpiresAt) > new Date());
+    if (result.premium && !premium) await users.updateOne(query, { $set: { premium: false } });
+    res.send({ ...result, premium });
 });
 
 
@@ -128,14 +223,15 @@ app.post('/jobs', async (req, res) => {
 
     const recruiter = await users.findOne(
         { _id: new ObjectId(recruiterId) },
-        { projection: { role: 1, premium: 1 } }
+        { projection: { role: 1, premium: 1, premiumExpiresAt: 1 } }
     );
     if (!recruiter || recruiter.role?.toLowerCase() !== 'recruiter') {
         return res.status(403).send({ error: 'Only recruiters can post jobs.' });
     }
 
     const count = await jobs.countDocuments({ recruiterId });
-    if (!recruiter.premium && count >= 2) {
+    const recruiterPremiumActive = Boolean(recruiter.premium) && (!recruiter.premiumExpiresAt || new Date(recruiter.premiumExpiresAt) > new Date());
+    if (!recruiterPremiumActive && count >= 2) {
         return res.status(403).send({ error: 'Free recruiters can post up to 2 jobs. Upgrade to Premium to post more.' });
     }
 
@@ -220,49 +316,15 @@ app.get('/applications/count', async (req, res) => {
 
 app.post('/payment/checkout-verify', async (req, res) => {
     const { sessionId } = req.body
-    const { status,
-        payment_status,
-        customer_email,
-        metadata,
-        payment_intent, }
-        = await stripe.checkout.sessions.retrieve(sessionId);
+    if (!sessionId) return res.status(400).send({ success: false, message: 'sessionId is required.' });
 
-    if (status === 'complete' && payment_status === 'paid') {
-
-        const sessionQuery = { sessionId };
-        const existingPayment = await payments.findOne(sessionQuery);
-        if (existingPayment) {
-            return res.send({ success: false, message: "Payment already verified" });
-        }
-
-
-        const payment = {
-            sessionId,
-            status,
-            payment_status,
-            payment_intent,
-            payment_date: new Date(),
-            customer_email,
-            userId: metadata.userId,
-        }
-        const result = await payments.insertOne(payment)
-
-        const query = { _id: new ObjectId(metadata.userId) };
-
-        const updateDoc = {
-            $set: {
-                premium: true
-            }
-        }
-
-        const updateResult = await users.updateOne(
-            query,
-            updateDoc
-        )
-        res.send({ success: true, result, updateResult })
-        return
+    const checkout = await stripe.checkout.sessions.retrieve(sessionId);
+    if (checkout.status === 'complete' && checkout.mode === 'payment' && checkout.payment_status === 'paid') {
+        const activated = await activatePremiumFromCheckout(checkout);
+        if (activated) return res.send({ success: true });
     }
-    res.send({ success: false, message: `Payment verification is faild` })
+
+    res.status(400).send({ success: false, message: 'Payment verification failed.' });
 });
 
 
