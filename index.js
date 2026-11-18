@@ -294,20 +294,70 @@ app.post('/applications', async (req, res) => {
 
 
 
+app.patch('/applications/:id/status', async (req, res) => {
+    const applicationId = req.params.id;
+    const { status, recruiterId } = req.body || {};
+    const allowedStatuses = ['applied', 'review', 'shortlisted', 'interview', 'waiting_list', 'approved', 'rejected', 'offered'];
+
+    if (!ObjectId.isValid(applicationId) || !ObjectId.isValid(recruiterId || '')) {
+        return res.status(400).send({ error: 'Valid application and recruiter IDs are required.' });
+    }
+    if (!allowedStatuses.includes(status)) {
+        return res.status(400).send({ error: 'Choose a valid application status.' });
+    }
+
+    const application = await applications.findOne({ _id: new ObjectId(applicationId) });
+    if (!application) return res.status(404).send({ error: 'Application not found.' });
+    if (!ObjectId.isValid(application.jobId)) return res.status(404).send({ error: 'Job not found.' });
+
+    const [job, recruiter] = await Promise.all([
+        jobs.findOne({ _id: new ObjectId(application.jobId) }, { projection: { recruiterId: 1 } }),
+        users.findOne({ _id: new ObjectId(recruiterId) }, { projection: { role: 1 } }),
+    ]);
+    if (!job || job.recruiterId !== recruiterId || recruiter?.role?.toLowerCase() !== 'recruiter') {
+        return res.status(403).send({ error: 'Only the job owner can update applicant status.' });
+    }
+
+    await applications.updateOne(
+        { _id: new ObjectId(applicationId) },
+        { $set: { status, statusUpdatedAt: new Date().toISOString() } }
+    );
+    res.send({ success: true, status });
+});
+
+app.get('/applications/counts', async (req, res) => {
+    const jobIds = typeof req.query.jobIds === 'string'
+        ? [...new Set(req.query.jobIds.split(',').map((id) => id.trim()).filter(Boolean))]
+        : [];
+    if (jobIds.length === 0) return res.status(400).send({ error: 'jobIds are required.' });
+
+    const grouped = await applications.aggregate([
+        { $match: { jobId: { $in: jobIds } } },
+        { $group: { _id: '$jobId', count: { $sum: 1 } } },
+    ]).toArray();
+    const counts = Object.fromEntries(jobIds.map((id) => [id, 0]));
+    for (const item of grouped) counts[item._id] = item.count;
+    res.send({ counts });
+});
+
 app.get('/applications', async (req, res) => {
     const query = {};
-    if (req.query.applicantId) {
-        query.userId = req.query.applicantId;
+    const applicantId = req.query.applicantId || req.query.userId;
+    if (applicantId) {
+        query.userId = applicantId;
     }
+    if (req.query.jobId) query.jobId = req.query.jobId;
     const result = await applications.find(query).toArray();
     res.send(result);
 });
 
 app.get('/applications/count', async (req, res) => {
     const query = {};
-    if (req.query.applicantId) {
-        query.userId = req.query.applicantId;
+    const applicantId = req.query.applicantId || req.query.userId;
+    if (applicantId) {
+        query.userId = applicantId;
     }
+    if (req.query.jobId) query.jobId = req.query.jobId;
     const result = await applications.countDocuments(query)
     res.send({ count: result });
 });
