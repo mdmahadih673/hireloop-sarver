@@ -83,6 +83,11 @@ app.get('/jobs', async (req, res) => {
         }
     }
 
+    const recruiterIdFilter = normalizedParams.recruiterid;
+    if (typeof recruiterIdFilter === 'string' && recruiterIdFilter.trim()) {
+        query.recruiterId = recruiterIdFilter.trim();
+    }
+
     const isRemote = normalizedParams.isremote?.toLowerCase();
     if (isRemote === 'true' || isRemote === 'false') {
         query.isRemote = isRemote === 'true';
@@ -94,6 +99,17 @@ app.get('/jobs', async (req, res) => {
 });
 
 
+
+app.get('/jobs/count', async (req, res) => {
+    const recruiterId = req.query.recruiterId;
+    if (typeof recruiterId !== 'string' || !recruiterId.trim()) {
+        return res.status(400).send({ error: 'recruiterId is required.' });
+    }
+
+    const count = await jobs.countDocuments({ recruiterId: recruiterId.trim() });
+    res.send({ count });
+});
+
 app.get('/jobs/:id', async (req, res) => {
     const id = req.params.id;
     const query = { _id: new ObjectId(id) };
@@ -102,7 +118,28 @@ app.get('/jobs/:id', async (req, res) => {
 });
 
 app.post('/jobs', async (req, res) => {
-    const job = { ...req.body, createdAt: new Date() };
+    const recruiterId = req.body?.recruiterId;
+    if (typeof recruiterId !== 'string' || !recruiterId.trim()) {
+        return res.status(400).send({ error: 'recruiterId is required.' });
+    }
+    if (!ObjectId.isValid(recruiterId)) {
+        return res.status(400).send({ error: 'Invalid recruiterId.' });
+    }
+
+    const recruiter = await users.findOne(
+        { _id: new ObjectId(recruiterId) },
+        { projection: { role: 1, premium: 1 } }
+    );
+    if (!recruiter || recruiter.role?.toLowerCase() !== 'recruiter') {
+        return res.status(403).send({ error: 'Only recruiters can post jobs.' });
+    }
+
+    const count = await jobs.countDocuments({ recruiterId });
+    if (!recruiter.premium && count >= 2) {
+        return res.status(403).send({ error: 'Free recruiters can post up to 2 jobs. Upgrade to Premium to post more.' });
+    }
+
+    const job = { ...req.body, recruiterId, createdAt: new Date() };
     const result = await jobs.insertOne(job);
     res.send(result);
 });
