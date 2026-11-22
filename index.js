@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { MongoClient, ObjectId } from 'mongodb';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import 'dotenv/config'
 import Stripe from 'stripe'
 
@@ -13,7 +14,17 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
 const app = express()
 const port = process.env.PORT || 5000;
 
-app.use(cors());
+const allowedOrigins = (process.env.FRONTEND_ORIGINS || 'http://localhost:3000')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+app.use(cors({
+    origin(origin, callback) {
+        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+        return callback(new Error('Origin is not allowed by CORS.'));
+    },
+    credentials: true,
+}));
 
 
 
@@ -35,6 +46,55 @@ const users = database.collection("user");
 const jobs = database.collection("jobs");
 const applications = database.collection("applications");
 const payments = database.collection("payment");
+const sessions = database.collection("session");
+
+function getSessionToken(req) {
+    const cookieHeader = req.headers.cookie || '';
+    const cookies = new Map(cookieHeader.split(';').map((part) => {
+        const separator = part.indexOf('=');
+        if (separator < 0) return ['', ''];
+        const name = part.slice(0, separator).trim();
+        let value = part.slice(separator + 1).trim();
+        try { value = decodeURIComponent(value); } catch { /* Keep the raw cookie value. */ }
+        return [name, value];
+    }));
+
+    const signedCookie = cookies.get('better-auth.session_token')
+        || cookies.get('__Secure-better-auth.session_token')
+        || cookies.get('__Host-better-auth.session_token');
+    if (!signedCookie || !process.env.BETTER_AUTH_SECRET) return null;
+
+    const separator = signedCookie.lastIndexOf('.');
+    if (separator <= 0) return null;
+    const token = signedCookie.slice(0, separator);
+    const providedSignature = Buffer.from(signedCookie.slice(separator + 1), 'base64');
+    const expectedSignature = createHmac('sha256', process.env.BETTER_AUTH_SECRET)
+        .update(token)
+        .digest();
+    if (providedSignature.length !== expectedSignature.length || !timingSafeEqual(providedSignature, expectedSignature)) return null;
+    return token;
+}
+
+async function requireAuth(req, res, next) {
+    if (!process.env.BETTER_AUTH_SECRET) {
+        return res.status(503).send({ error: 'Backend authentication is not configured.' });
+    }
+
+    try {
+        const token = getSessionToken(req);
+        if (!token) return res.status(401).send({ error: 'Please sign in.' });
+
+        const session = await sessions.findOne({ token, expiresAt: { $gt: new Date() } });
+        if (!session || !ObjectId.isValid(session.userId)) return res.status(401).send({ error: 'Your session has expired. Please sign in again.' });
+
+        const user = await users.findOne({ _id: new ObjectId(session.userId) });
+        if (!user) return res.status(401).send({ error: 'Account not found.' });
+        req.authUser = { ...user, id: String(user._id) };
+        return next();
+    } catch (error) {
+        return next(error);
+    }
+}
 
 const premiumPlanDays = {
     seeker: { monthly: 30, quarterly: 90, annual: 365 },
@@ -129,16 +189,18 @@ app.use(express.json());
 
 
 
-app.get('/users', async (req, res) => {
+app.get('/users', requireAuth, async (req, res) => {
+    if (req.authUser.role?.toLowerCase() !== 'admin') return res.status(403).send({ error: 'Admin access is required.' });
     const cursor = users.find({});
     const results = await cursor.toArray();
     res.send(results);
 });
 
 
-app.get('/users/:id/premimun', async (req, res) => {
+app.get('/users/:id/premimun', requireAuth, async (req, res) => {
     const id = req.params.id
     if (!ObjectId.isValid(id)) return res.status(400).send({ error: 'Invalid user id.' });
+    if (req.authUser.id !== id) return res.status(403).send({ error: 'You can only view your own Premium status.' });
     const query = { _id: new ObjectId(id) };
     const result = await users.findOne(query, { projection: { premium: 1, premiumExpiresAt: 1, premiumRole: 1, premiumPlan: 1 } });
     if (!result) return res.status(404).send({ error: 'User not found.' });
@@ -195,13 +257,9 @@ app.get('/jobs', async (req, res) => {
 
 
 
-app.get('/jobs/count', async (req, res) => {
-    const recruiterId = req.query.recruiterId;
-    if (typeof recruiterId !== 'string' || !recruiterId.trim()) {
-        return res.status(400).send({ error: 'recruiterId is required.' });
-    }
-
-    const count = await jobs.countDocuments({ recruiterId: recruiterId.trim() });
+app.get('/jobs/count', requireAuth, async (req, res) => {
+    if (req.authUser.role?.toLowerCase() !== 'recruiter') return res.status(403).send({ error: 'Only recruiters can check recruiter job limits.' });
+    const count = await jobs.countDocuments({ recruiterId: req.authUser.id });
     res.send({ count });
 });
 
@@ -212,23 +270,13 @@ app.get('/jobs/:id', async (req, res) => {
     res.send(result);
 });
 
-app.post('/jobs', async (req, res) => {
-    const recruiterId = req.body?.recruiterId;
-    if (typeof recruiterId !== 'string' || !recruiterId.trim()) {
-        return res.status(400).send({ error: 'recruiterId is required.' });
-    }
-    if (!ObjectId.isValid(recruiterId)) {
-        return res.status(400).send({ error: 'Invalid recruiterId.' });
-    }
-
-    const recruiter = await users.findOne(
-        { _id: new ObjectId(recruiterId) },
-        { projection: { role: 1, premium: 1, premiumExpiresAt: 1 } }
-    );
-    if (!recruiter || recruiter.role?.toLowerCase() !== 'recruiter') {
+app.post('/jobs', requireAuth, async (req, res) => {
+    if (req.authUser.role?.toLowerCase() !== 'recruiter') {
         return res.status(403).send({ error: 'Only recruiters can post jobs.' });
     }
 
+    const recruiterId = req.authUser.id;
+    const recruiter = req.authUser;
     const count = await jobs.countDocuments({ recruiterId });
     const recruiterPremiumActive = Boolean(recruiter.premium) && (!recruiter.premiumExpiresAt || new Date(recruiter.premiumExpiresAt) > new Date());
     if (!recruiterPremiumActive && count >= 2) {
@@ -241,44 +289,56 @@ app.post('/jobs', async (req, res) => {
 });
 
 
-app.delete('/jobs/:id', async (req, res) => {
+app.delete('/jobs/:id', requireAuth, async (req, res) => {
     const id = req.params.id;
+    if (!ObjectId.isValid(id)) return res.status(400).send({ error: 'Invalid job id.' });
     const query = { _id: new ObjectId(id) };
+    const job = await jobs.findOne(query, { projection: { recruiterId: 1 } });
+    if (!job) return res.status(404).send({ error: 'Job not found.' });
+    if (req.authUser.role?.toLowerCase() !== 'admin' && job.recruiterId !== req.authUser.id) {
+        return res.status(403).send({ error: 'You can only delete your own job posts.' });
+    }
     const result = await jobs.deleteOne(query);
     res.send(result);
 });
 
 
-app.patch('/jobs/:id', async (req, res) => {
+app.patch('/jobs/:id', requireAuth, async (req, res) => {
     const id = req.params.id;
+    if (!ObjectId.isValid(id)) return res.status(400).send({ error: 'Invalid job id.' });
     const query = { _id: new ObjectId(id) };
+    const job = await jobs.findOne(query, { projection: { recruiterId: 1 } });
+    if (!job) return res.status(404).send({ error: 'Job not found.' });
+    if (req.authUser.role?.toLowerCase() !== 'admin' && job.recruiterId !== req.authUser.id) {
+        return res.status(403).send({ error: 'You can only edit your own job posts.' });
+    }
+    const editableFields = Object.fromEntries(
+        Object.entries(req.body || {}).filter(([field]) => !['_id', 'recruiterId', 'createdAt'].includes(field))
+    );
     const updateDoc = {
-        $set: req.body,
+        $set: editableFields,
     };
     const result = await jobs.updateOne(query, updateDoc);
     res.send(result);
 });
 
 
-app.post('/applications', async (req, res) => {
+app.post('/applications', requireAuth, async (req, res) => {
     const { jobId, userId, applicantName, applicantEmail, jobTitle, companyName, jobType, location, isRemote } = req.body || {};
 
-    if (!jobId || !userId) {
-        return res.status(400).send({ error: "jobId and userId are required." });
+    if (!jobId || !ObjectId.isValid(jobId)) {
+        return res.status(400).send({ error: "A valid jobId is required." });
     }
-    if (!ObjectId.isValid(userId)) {
-        return res.status(400).send({ error: "Invalid userId." });
-    }
-
-    const user = await users.findOne(
-        { _id: new ObjectId(userId) },
-        { projection: { role: 1, premium: 1, premiumRole: 1, premiumExpiresAt: 1 } }
-    );
-    if (!user || user.role?.toLowerCase() !== 'seeker') {
+    const user = req.authUser;
+    if (user.role?.toLowerCase() !== 'seeker') {
         return res.status(403).send({ error: "Only job seekers can apply." });
     }
+    const authenticatedUserId = user.id;
 
-    const existing = await applications.findOne({ jobId, userId });
+    const job = await jobs.findOne({ _id: new ObjectId(jobId) });
+    if (!job) return res.status(404).send({ error: 'Job not found.' });
+
+    const existing = await applications.findOne({ jobId, userId: authenticatedUserId });
     if (existing) {
         return res.status(409).send({ error: "You already applied to this job." });
     }
@@ -287,7 +347,7 @@ app.post('/applications', async (req, res) => {
         && (!user.premiumRole || user.premiumRole === 'seeker')
         && (!user.premiumExpiresAt || new Date(user.premiumExpiresAt) > new Date());
     if (!premiumActive) {
-        const applicationCount = await applications.countDocuments({ userId });
+        const applicationCount = await applications.countDocuments({ userId: authenticatedUserId });
         if (applicationCount >= 2) {
             return res.status(403).send({
                 error: "The free plan allows up to 2 job applications. Upgrade to Premium to apply to more jobs.",
@@ -298,14 +358,14 @@ app.post('/applications', async (req, res) => {
 
     const application = {
         jobId,
-        userId,
-        applicantName,
-        applicantEmail,
-        jobTitle,
-        companyName,
-        jobType,
-        location,
-        isRemote: Boolean(isRemote),
+        userId: authenticatedUserId,
+        applicantName: user.name || applicantName || 'Hireloop member',
+        applicantEmail: user.email || applicantEmail || '',
+        jobTitle: job.title || jobTitle || '',
+        companyName: job.companyName || companyName || '',
+        jobType: job.jobType || jobType || '',
+        location: job.location || location || '',
+        isRemote: Boolean(job.isRemote ?? isRemote),
         status: "applied",
         appliedAt: new Date().toISOString(),
         archived: false,
@@ -318,14 +378,13 @@ app.post('/applications', async (req, res) => {
 
 
 
-app.patch('/applications/:id/status', async (req, res) => {
+app.patch('/applications/:id/status', requireAuth, async (req, res) => {
     const applicationId = req.params.id;
-    const { status, recruiterId } = req.body || {};
+    const { status } = req.body || {};
     const allowedStatuses = ['applied', 'review', 'shortlisted', 'interview', 'waiting_list', 'approved', 'rejected', 'offered'];
 
-    if (!ObjectId.isValid(applicationId) || !ObjectId.isValid(recruiterId || '')) {
-        return res.status(400).send({ error: 'Valid application and recruiter IDs are required.' });
-    }
+    if (!ObjectId.isValid(applicationId)) return res.status(400).send({ error: 'Valid application ID is required.' });
+    if (req.authUser.role?.toLowerCase() !== 'recruiter') return res.status(403).send({ error: 'Only recruiters can update applicant status.' });
     if (!allowedStatuses.includes(status)) {
         return res.status(400).send({ error: 'Choose a valid application status.' });
     }
@@ -334,11 +393,8 @@ app.patch('/applications/:id/status', async (req, res) => {
     if (!application) return res.status(404).send({ error: 'Application not found.' });
     if (!ObjectId.isValid(application.jobId)) return res.status(404).send({ error: 'Job not found.' });
 
-    const [job, recruiter] = await Promise.all([
-        jobs.findOne({ _id: new ObjectId(application.jobId) }, { projection: { recruiterId: 1 } }),
-        users.findOne({ _id: new ObjectId(recruiterId) }, { projection: { role: 1 } }),
-    ]);
-    if (!job || job.recruiterId !== recruiterId || recruiter?.role?.toLowerCase() !== 'recruiter') {
+    const job = await jobs.findOne({ _id: new ObjectId(application.jobId) }, { projection: { recruiterId: 1 } });
+    if (!job || job.recruiterId !== req.authUser.id) {
         return res.status(403).send({ error: 'Only the job owner can update applicant status.' });
     }
 
@@ -349,11 +405,25 @@ app.patch('/applications/:id/status', async (req, res) => {
     res.send({ success: true, status });
 });
 
-app.get('/applications/counts', async (req, res) => {
+app.get('/applications/counts', requireAuth, async (req, res) => {
     const jobIds = typeof req.query.jobIds === 'string'
         ? [...new Set(req.query.jobIds.split(',').map((id) => id.trim()).filter(Boolean))]
         : [];
     if (jobIds.length === 0) return res.status(400).send({ error: 'jobIds are required.' });
+    if (req.authUser.role?.toLowerCase() !== 'admin' && req.authUser.role?.toLowerCase() !== 'recruiter') {
+        return res.status(403).send({ error: 'Only recruiters can view applicant counts.' });
+    }
+
+    if (req.authUser.role?.toLowerCase() === 'recruiter') {
+        const ownedJobs = await jobs.find(
+            { _id: { $in: jobIds.filter((id) => ObjectId.isValid(id)).map((id) => new ObjectId(id)) }, recruiterId: req.authUser.id },
+            { projection: { _id: 1 } }
+        ).toArray();
+        const ownedJobIds = new Set(ownedJobs.map((job) => String(job._id)));
+        if (jobIds.some((id) => !ownedJobIds.has(id))) {
+            return res.status(403).send({ error: 'You can only view applicant counts for your own jobs.' });
+        }
+    }
 
     const grouped = await applications.aggregate([
         { $match: { jobId: { $in: jobIds } } },
@@ -364,25 +434,26 @@ app.get('/applications/counts', async (req, res) => {
     res.send({ counts });
 });
 
-app.get('/applications', async (req, res) => {
+app.get('/applications', requireAuth, async (req, res) => {
     const query = {};
-    const applicantId = req.query.applicantId || req.query.userId;
-    if (applicantId) {
-        query.userId = applicantId;
+    if (req.authUser.role?.toLowerCase() === 'seeker') {
+        query.userId = req.authUser.id;
+    } else if (req.authUser.role?.toLowerCase() === 'recruiter' && typeof req.query.jobId === 'string') {
+        if (!ObjectId.isValid(req.query.jobId)) return res.status(400).send({ error: 'Invalid jobId.' });
+        const job = await jobs.findOne({ _id: new ObjectId(req.query.jobId) }, { projection: { recruiterId: 1 } });
+        if (!job || job.recruiterId !== req.authUser.id) return res.status(403).send({ error: 'You can only view applicants for your own jobs.' });
+        query.jobId = req.query.jobId;
+    } else if (req.authUser.role?.toLowerCase() !== 'admin') {
+        return res.status(403).send({ error: 'You are not allowed to view these applications.' });
     }
-    if (req.query.jobId) query.jobId = req.query.jobId;
+    if (req.authUser.role?.toLowerCase() === 'admin' && typeof req.query.jobId === 'string') query.jobId = req.query.jobId;
     const result = await applications.find(query).toArray();
     res.send(result);
 });
 
-app.get('/applications/count', async (req, res) => {
-    const query = {};
-    const applicantId = req.query.applicantId || req.query.userId;
-    if (applicantId) {
-        query.userId = applicantId;
-    }
-    if (req.query.jobId) query.jobId = req.query.jobId;
-    const result = await applications.countDocuments(query)
+app.get('/applications/count', requireAuth, async (req, res) => {
+    if (req.authUser.role?.toLowerCase() !== 'seeker') return res.status(403).send({ error: 'Only seekers can view their application count.' });
+    const result = await applications.countDocuments({ userId: req.authUser.id });
     res.send({ count: result });
 });
 
