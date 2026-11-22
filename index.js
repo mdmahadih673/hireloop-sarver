@@ -266,10 +266,34 @@ app.post('/applications', async (req, res) => {
     if (!jobId || !userId) {
         return res.status(400).send({ error: "jobId and userId are required." });
     }
+    if (!ObjectId.isValid(userId)) {
+        return res.status(400).send({ error: "Invalid userId." });
+    }
+
+    const user = await users.findOne(
+        { _id: new ObjectId(userId) },
+        { projection: { role: 1, premium: 1, premiumRole: 1, premiumExpiresAt: 1 } }
+    );
+    if (!user || user.role?.toLowerCase() !== 'seeker') {
+        return res.status(403).send({ error: "Only job seekers can apply." });
+    }
 
     const existing = await applications.findOne({ jobId, userId });
     if (existing) {
         return res.status(409).send({ error: "You already applied to this job." });
+    }
+
+    const premiumActive = Boolean(user.premium)
+        && (!user.premiumRole || user.premiumRole === 'seeker')
+        && (!user.premiumExpiresAt || new Date(user.premiumExpiresAt) > new Date());
+    if (!premiumActive) {
+        const applicationCount = await applications.countDocuments({ userId });
+        if (applicationCount >= 2) {
+            return res.status(403).send({
+                error: "The free plan allows up to 2 job applications. Upgrade to Premium to apply to more jobs.",
+                code: "JOB_APPLICATION_LIMIT_REACHED",
+            });
+        }
     }
 
     const application = {
