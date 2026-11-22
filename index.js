@@ -191,9 +191,19 @@ app.use(express.json());
 
 app.get('/users', requireAuth, async (req, res) => {
     if (req.authUser.role?.toLowerCase() !== 'admin') return res.status(403).send({ error: 'Admin access is required.' });
-    const cursor = users.find({});
+    const cursor = users.find({}, { projection: { name: 1, email: 1, role: 1, createdAt: 1, premium: 1, premiumExpiresAt: 1 } });
     const results = await cursor.toArray();
     res.send(results);
+});
+
+app.get('/admin/stats', requireAuth, async (req, res) => {
+    if (req.authUser.role?.toLowerCase() !== 'admin') return res.status(403).send({ error: 'Admin access is required.' });
+    const [userCount, jobCount, applicationCount] = await Promise.all([
+        users.countDocuments(),
+        jobs.countDocuments(),
+        applications.countDocuments(),
+    ]);
+    res.send({ userCount, jobCount, applicationCount });
 });
 
 
