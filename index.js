@@ -459,11 +459,15 @@ app.get('/applications/count', requireAuth, async (req, res) => {
 
 // payment api 
 
-app.post('/payment/checkout-verify', async (req, res) => {
+app.post('/payment/checkout-verify', requireAuth, async (req, res) => {
     const { sessionId } = req.body
     if (!sessionId) return res.status(400).send({ success: false, message: 'sessionId is required.' });
 
     const checkout = await stripe.checkout.sessions.retrieve(sessionId);
+    if (checkout.metadata?.userId !== req.authUser.id || checkout.metadata?.role !== req.authUser.role?.toLowerCase()) {
+        return res.status(403).send({ success: false, message: 'This payment does not belong to your account.' });
+    }
+
     if (checkout.status === 'complete' && checkout.mode === 'payment' && checkout.payment_status === 'paid') {
         const activated = await activatePremiumFromCheckout(checkout);
         if (activated) return res.send({ success: true });
